@@ -1,7 +1,6 @@
 const express = require('express');
 const app = express();
 
-// Giả lập User-Agent trình duyệt để API NguonC không chặn request từ Vercel
 const HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'application/json'
@@ -13,11 +12,11 @@ app.use((req, res, next) => {
     next();
 });
 
-// 1. Manifest (Đổi ID sang com.nguonc.v3.stremio để xóa triệt để cache cũ trên Stremio)
+// 1. Manifest
 app.get('/manifest.json', (req, res) => {
     res.json({
-        id: 'com.nguonc.v3.stremio',
-        version: '3.0.0',
+        id: 'com.nguonc.v4.stremio',
+        version: '4.0.0',
         name: 'NguonC Phim Vietsub',
         description: 'Xem phim Vietsub/Thuyết minh từ NguonC',
         resources: ['catalog', 'meta', 'stream'],
@@ -40,34 +39,45 @@ app.get('/manifest.json', (req, res) => {
     });
 });
 
-// 2. Catalog (Danh sách phim & Tìm kiếm)
+function getNumberFromString(str) {
+    if (!str) return 1;
+    let numStr = '';
+    for (let i = 0; i < str.length; i++) {
+        if (str[i] >= '0' && str[i] <= '9') {
+            numStr += str[i];
+        }
+    }
+    return numStr ? parseInt(numStr) : 1;
+}
+
+// 2. Catalog
 app.get('/catalog/:type/:id*', async (req, res) => {
     try {
-        const { type } = req.params;
+        const type = req.params.type;
         const rawPath = req.params[0] || '';
         let query = '';
 
         if (rawPath.includes('search=')) {
-            const match = rawPath.match(/search=([^/.]+)/);
-            if (match && match[1]) {
-                query = decodeURIComponent(match[1]);
+            const parts = rawPath.split('search=');
+            if (parts.length > 1) {
+                query = decodeURIComponent(parts[1].split('.')[0].split('/')[0]);
             }
         }
 
         let url = 'https://phim.nguonc.com/api/films/phim-moi-cap-nhat?page=1';
         if (query) {
-            url = `https://phim.nguonc.com/api/films/search?keyword=${encodeURIComponent(query)}`;
+            url = 'https://phim.nguonc.com/api/films/search?keyword=' + encodeURIComponent(query);
         }
 
         const apiRes = await fetch(url, { headers: HEADERS });
         const data = await apiRes.json();
 
         const metas = (data.items || []).map(item => ({
-            id: `nguonc:${item.slug}`,
+            id: 'nguonc:' + item.slug,
             type: type || 'movie',
             name: item.name,
             poster: item.thumb_url || item.poster_url,
-            description: `${item.original_name || ''} | ${item.current_episode || ''}`
+            description: (item.original_name || '') + ' | ' + (item.current_episode || '')
         }));
 
         res.json({ metas });
@@ -76,18 +86,18 @@ app.get('/catalog/:type/:id*', async (req, res) => {
     }
 });
 
-// 3. Meta (Chi tiết phim & Bảng danh sách tập - Yêu cầu bắt buộc của Stremio)
+// 3. Meta
 app.get('/meta/:type/:id*', async (req, res) => {
     try {
-        const { type } = req.params;
-        const fullId = (req.params.id + (req.params[0] || '')).replace('.json', '');
-        
+        const type = req.params.type;
+        const fullId = (req.params.id + (req.params[0] || '')).split('.')[0];
+
         if (!fullId.startsWith('nguonc:')) {
             return res.json({ meta: null });
         }
 
         const slug = fullId.replace('nguonc:', '').split(':')[0];
-        const apiRes = await fetch(`https://phim.nguonc.com/api/film/${slug}`, { headers: HEADERS });
+        const apiRes = await fetch('https://phim.nguonc.com/api/film/' + slug, { headers: HEADERS });
         const data = await apiRes.json();
 
         if (data.status !== 'success' || !data.movie) {
@@ -100,10 +110,10 @@ app.get('/meta/:type/:id*', async (req, res) => {
         let videos = [];
         if (episodes.length > 0 && episodes[0].items) {
             videos = episodes[0].items.map((item, idx) => {
-                const epNum = parseInt(item.name.replace(/\D/g, '')) || (idx + 1);
+                const epNum = getNumberFromString(item.name) || (idx + 1);
                 return {
-                    id: `nguonc:${slug}:${epNum}`,
-                    title: `Tập ${item.name}`,
+                    id: 'nguonc:' + slug + ':' + epNum,
+                    title: 'Tập ' + item.name,
                     season: 1,
                     episode: epNum
                 };
@@ -112,7 +122,7 @@ app.get('/meta/:type/:id*', async (req, res) => {
 
         res.json({
             meta: {
-                id: `nguonc:${slug}`,
+                id: 'nguonc:' + slug,
                 type: type,
                 name: film.name,
                 poster: film.thumb_url || film.poster_url,
@@ -126,12 +136,12 @@ app.get('/meta/:type/:id*', async (req, res) => {
     }
 });
 
-// 4. Stream (Trích xuất link m3u8 phát trực tiếp)
+// 4. Stream
 app.get('/stream/:type/:id*', async (req, res) => {
     try {
-        const { type } = req.params;
-        const fullId = (req.params.id + (req.params[0] || '')).replace('.json', '');
-        
+        const type = req.params.type;
+        const fullId = (req.params.id + (req.params[0] || '')).split('.')[0];
+
         let targetSlug = '';
         let episode = 1;
 
@@ -144,20 +154,14 @@ app.get('/stream/:type/:id*', async (req, res) => {
             const imdbId = parts[0];
             episode = parts[2] ? parseInt(parts[2]) : (parts[1] ? parseInt(parts[1]) : 1);
 
-            const cinemetaRes = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`);
+            const cinemetaRes = await fetch('https://v3-cinemeta.strem.io/meta/' + type + '/' + imdbId + '.json');
             const cinemetaData = await cinemetaRes.json();
 
             if (cinemetaData && cinemetaData.meta && cinemetaData.meta.name) {
                 const rawName = cinemetaData.meta.name;
-                const cleanName = rawName.replace(/[:\-]/g, ' ').replace(/\s+/g, ' ').trim();
 
-                let searchRes = await fetch(`https://phim.nguonc.com/api/films/search?keyword=${encodeURIComponent(cleanName)}`, { headers: HEADERS });
+                let searchRes = await fetch('https://phim.nguonc.com/api/films/search?keyword=' + encodeURIComponent(rawName), { headers: HEADERS });
                 let searchData = await searchRes.json();
-
-                if (!searchData || !searchData.items || searchData.items.length === 0) {
-                    searchRes = await fetch(`https://phim.nguonc.com/api/films/search?keyword=${encodeURIComponent(rawName)}`, { headers: HEADERS });
-                    searchData = await searchRes.json();
-                }
 
                 if (searchData && searchData.items && searchData.items.length > 0) {
                     targetSlug = searchData.items[0].slug;
@@ -169,7 +173,7 @@ app.get('/stream/:type/:id*', async (req, res) => {
             return res.json({ streams: [] });
         }
 
-        const filmRes = await fetch(`https://phim.nguonc.com/api/film/${targetSlug}`, { headers: HEADERS });
+        const filmRes = await fetch('https://phim.nguonc.com/api/film/' + targetSlug, { headers: HEADERS });
         const filmData = await filmRes.json();
 
         if (filmData.status !== 'success' || !filmData.movie) {
@@ -183,10 +187,7 @@ app.get('/stream/:type/:id*', async (req, res) => {
         episodes.forEach(server => {
             if (!server.items || server.items.length === 0) return;
 
-            let item = server.items.find(ep => {
-                const num = parseInt(ep.name.replace(/\D/g, ''));
-                return num === epIndex;
-            });
+            let item = server.items.find(ep => getNumberFromString(ep.name) === epIndex);
 
             if (!item) {
                 item = server.items[epIndex - 1] || server.items[0];
@@ -194,8 +195,8 @@ app.get('/stream/:type/:id*', async (req, res) => {
 
             if (item && item.m3u8) {
                 streams.push({
-                    name: `NguonC [${server.server_name}]`,
-                    title: `${filmData.movie.name} - ${item.name}`,
+                    name: 'NguonC [' + server.server_name + ']',
+                    title: filmData.movie.name + ' - ' + item.name,
                     url: item.m3u8
                 });
             }
