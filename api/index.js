@@ -1,59 +1,76 @@
 const express = require('express');
 const app = express();
 
-// Cấu hình CORS để Stremio kết nối được tới server
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', '*');
     next();
 });
 
-// 1. Trả về cấu hình Addon (Manifest)
+// 1. Manifest khai báo nhận ID dạng IMDb (tt...)
 app.get('/manifest.json', (req, res) => {
     res.json({
         id: 'com.nguonc.stremio.addon',
         version: '1.0.0',
         name: 'NguonC Phim',
-        description: 'Xem phim Vietsub/Thuyết minh từ NguonC',
+        description: 'Tự động tìm Vietsub/Thuyết minh từ NguonC',
         resources: ['stream'],
         types: ['movie', 'series'],
-        idPrefixes: ['nguonc_']
+        idPrefixes: ['tt']
     });
 });
 
-// 2. Xử lý yêu cầu lấy nguồn phát phim từ API NguonC
+// 2. Xử lý yêu cầu lấy luồng phát từ Stremio (Mã tt...)
 app.get('/stream/:type/:id.json', async (req, res) => {
-    const { id } = req.params;
-    // Cấu trúc ID truyền từ Stremio: nguonc_<slug-phim>_<tap>
-    // Ví dụ: nguonc_hoa-thien-cot_1
-    const cleanId = id.replace('.json', '');
-    const parts = cleanId.split('_');
-    const slug = parts[1];
-    const epIndex = parts[2] ? parseInt(parts[2]) : 1;
-
-    if (!slug) {
-        return res.json({ streams: [] });
-    }
-
     try {
-        // Gọi API NguonC theo slug
-        const apiRes = await fetch(`https://phim.nguonc.com/api/film/${slug}`);
-        const data = await apiRes.json();
+        const { type, id } = req.params;
+        const cleanId = id.replace('.json', '');
+        
+        // Tách IMDb ID và số tập (Ví dụ phim bộ: tt1234567:1:2 -> IMDb: tt1234567, Tập: 2)
+        const parts = cleanId.split(':');
+        const imdbId = parts[0];
+        const episode = parts[2] ? parseInt(parts[2]) : (parts[1] ? parseInt(parts[1]) : 1);
 
-        if (data.status !== 'success' || !data.movie) {
+        // Lấy tên phim từ Cinemeta của Stremio qua IMDb ID
+        const cinemetaRes = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`);
+        const cinemetaData = await cinemetaRes.json();
+        
+        if (!cinemetaData || !cinemetaData.meta || !cinemetaData.meta.name) {
+            return res.json({ streams: [] });
+        }
+
+        const movieName = cinemetaData.meta.name;
+
+        // Tìm phim trên NguonC bằng tên phim
+        const searchRes = await fetch(`https://phim.nguonc.com/api/films/search?keyword=${encodeURIComponent(movieName)}`);
+        const searchData = await searchRes.json();
+
+        if (!searchData || searchData.status !== 'success' || !searchData.items || searchData.items.length === 0) {
+            return res.json({ streams: [] });
+        }
+
+        // Lấy kết quả đầu tiên khớp nhất
+        const targetSlug = searchData.items[0].slug;
+
+        // Lấy danh sách tập phim từ NguonC
+        const filmRes = await fetch(`https://phim.nguonc.com/api/film/${targetSlug}`);
+        const filmData = await filmRes.json();
+
+        if (!filmData || filmData.status !== 'success' || !filmData.movie) {
             return res.json({ streams: [] });
         }
 
         const streams = [];
-        const episodes = data.movie.episodes || [];
+        const episodes = filmData.movie.episodes || [];
+        const epIndex = type === 'movie' ? 1 : episode;
 
-        // Duyệt danh sách tập phim để lấy link m3u8
+        // Trích xuất link m3u8
         episodes.forEach(server => {
-            const item = server.items[epIndex - 1];
+            const item = server.items.find(ep => parseInt(ep.name) === epIndex) || server.items[epIndex - 1];
             if (item && item.m3u8) {
                 streams.push({
                     name: `NguonC [${server.server_name}]`,
-                    title: `${data.movie.name} - ${item.name}`,
+                    title: `${filmData.movie.name} - Tập ${item.name}`,
                     url: item.m3u8
                 });
             }
